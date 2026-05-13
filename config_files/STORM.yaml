@@ -44,3 +44,9 @@ Models:
     ValueWeightMax: 1.1
     UWLTemperature: 1.0
     UWLEps: 1e-8
+    UncertaintyMode: "single"
+    EnsembleSize: 1
+    AleatoricCoef: 0.2
+    EpistemicCoef: 1.0
+    UseVarVarEpistemic: True
+    UseBootstrapEnsemble: False
