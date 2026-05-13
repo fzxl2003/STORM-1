@@ -35,13 +35,29 @@ def calc_lambda_return(rewards, values, termination, gamma, lam, dtype=torch.flo
 
 
 class ActorCriticAgent(nn.Module):
-    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef) -> None:
+    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef,
+                 use_uwl=False, weight_type=0,
+                 actor_weight_min=0.2, actor_weight_max=1.2,
+                 value_weight_min=0.2, value_weight_max=1.2,
+                 uwl_temperature=1.0, uwl_eps=1e-8) -> None:
         super().__init__()
         self.gamma = gamma
         self.lambd = lambd
         self.entropy_coef = entropy_coef
         self.use_amp = True
         self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
+        self.use_uwl = use_uwl
+        self.weight_type = weight_type
+        self.actor_weight_min = actor_weight_min
+        self.actor_weight_max = actor_weight_max
+        self.value_weight_min = value_weight_min
+        self.value_weight_max = value_weight_max
+        self.uwl_temperature = uwl_temperature
+        self.uwl_eps = uwl_eps
+        print(f'ActorCriticAgent use_uwl: {self.use_uwl}, weight_type: {self.weight_type}')
+        print(f'Actor weight range: [{self.actor_weight_min}, {self.actor_weight_max}]')
+        print(f'Value weight range: [{self.value_weight_min}, {self.value_weight_max}]')
+        print(f'UWL temperature: {self.uwl_temperature}, eps: {self.uwl_eps}')
 
         self.symlog_twohot_loss = SymLogTwoHotLoss(255, -20, 20)
 
@@ -85,6 +101,47 @@ class ActorCriticAgent(nn.Module):
         self.optimizer = torch.optim.Adam(self.parameters(), lr=3e-5, eps=1e-5)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
+    def _normalize_confidence(self, confidence):
+        temp = self.uwl_temperature
+        eps = self.uwl_eps
+        flat = confidence.reshape(-1, confidence.shape[-1])
+        mean = torch.mean(flat, dim=0, keepdim=True)
+        std = torch.std(flat, dim=0, unbiased=False, keepdim=True)
+        std = torch.clamp(std, min=eps)
+        normalized = (flat - mean) / std
+        scaled = torch.tanh(temp * normalized)
+
+        actor_center = (self.actor_weight_max + self.actor_weight_min) / 2.0
+        actor_half_range = (self.actor_weight_max - self.actor_weight_min) / 2.0
+        actor_weights = actor_center + actor_half_range * scaled
+
+        value_center = (self.value_weight_max + self.value_weight_min) / 2.0
+        value_half_range = (self.value_weight_max - self.value_weight_min) / 2.0
+        value_weights = value_center + value_half_range * scaled
+
+        return actor_weights.reshape_as(confidence), value_weights.reshape_as(confidence)
+
+    def _compute_weights(self, confidence):
+        actor_weights, value_weights = self._normalize_confidence(confidence)
+        if self.weight_type == 0:
+            actor_weights = None
+            value_weights = None
+        elif self.weight_type == 1:
+            value_weights = None
+        elif self.weight_type == 2:
+            actor_weights = None
+        elif self.weight_type == 3:
+            pass
+        else:
+            actor_weights = None
+            value_weights = None
+        return actor_weights, value_weights
+
+    def _weighted_mean(self, tensor, weights):
+        weights = weights.to(tensor.dtype)
+        total_weight = torch.clamp(weights.sum(), min=1e-6)
+        return (tensor * weights).sum() / total_weight
+
     @torch.no_grad()
     def update_slow_critic(self, decay=0.98):
         for slow_param, param in zip(self.slow_critic.parameters(), self.critic.parameters()):
@@ -126,7 +183,7 @@ class ActorCriticAgent(nn.Module):
         action = self.sample(latent, greedy)
         return action.detach().cpu().squeeze(-1).numpy()
 
-    def update(self, latent, action, old_logprob, old_value, reward, termination, logger=None):
+    def update(self, latent, action, old_logprob, old_value, reward, termination, confidence=None, logger=None):
         '''
         Update policy and value model
         '''
@@ -143,16 +200,37 @@ class ActorCriticAgent(nn.Module):
             value = self.symlog_twohot_loss.decode(raw_value)
             lambda_return = calc_lambda_return(reward, value, termination, self.gamma, self.lambd)
 
+            actor_weights = None
+            value_weights = None
+            if self.use_uwl and confidence is not None:
+                actor_weights, value_weights = self._compute_weights(confidence)
+                if actor_weights is not None:
+                    actor_weights = actor_weights.squeeze(-1)
+                if value_weights is not None:
+                    value_weights = value_weights.squeeze(-1)
+
             # update value function with slow critic regularization
-            value_loss = self.symlog_twohot_loss(raw_value[:, :-1], lambda_return.detach())
-            slow_value_regularization_loss = self.symlog_twohot_loss(raw_value[:, :-1], slow_lambda_return.detach())
+            if value_weights is not None:
+                value_loss = self.symlog_twohot_loss(raw_value[:, :-1], lambda_return.detach(), weights=value_weights)
+                slow_value_regularization_loss = self.symlog_twohot_loss(
+                    raw_value[:, :-1], slow_lambda_return.detach(), weights=value_weights)
+                # print('Using value weights in value loss')
+            else:
+                value_loss = self.symlog_twohot_loss(raw_value[:, :-1], lambda_return.detach())
+                slow_value_regularization_loss = self.symlog_twohot_loss(
+                    raw_value[:, :-1], slow_lambda_return.detach())
 
             lower_bound = self.lowerbound_ema(percentile(lambda_return, 0.05))
             upper_bound = self.upperbound_ema(percentile(lambda_return, 0.95))
             S = upper_bound-lower_bound
             norm_ratio = torch.max(torch.ones(1).cuda(), S)  # max(1, S) in the paper
             norm_advantage = (lambda_return-value[:, :-1]) / norm_ratio
-            policy_loss = -(log_prob * norm_advantage.detach()).mean()
+            if actor_weights is not None:
+                # print('Using actor weights in policy loss')
+                actor_weights = actor_weights.to(log_prob.dtype)
+                policy_loss = -self._weighted_mean(log_prob * norm_advantage.detach(), actor_weights)
+            else:
+                policy_loss = -(log_prob * norm_advantage.detach()).mean()
 
             entropy_loss = entropy.mean()
 
@@ -175,3 +253,7 @@ class ActorCriticAgent(nn.Module):
             logger.log('ActorCritic/S', S.item())
             logger.log('ActorCritic/norm_ratio', norm_ratio.item())
             logger.log('ActorCritic/total_loss', loss.item())
+            if actor_weights is not None:
+                logger.log('ActorCritic/actor_weight_mean', actor_weights.mean().item())
+            if value_weights is not None:
+                logger.log('ActorCritic/value_weight_mean', value_weights.mean().item())

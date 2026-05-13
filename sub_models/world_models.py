@@ -215,7 +215,8 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
 
 class WorldModel(nn.Module):
     def __init__(self, in_channels, action_dim,
-                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads):
+                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads,
+                 uwl_eps=1e-8):
         super().__init__()
         self.transformer_hidden_dim = transformer_hidden_dim
         self.final_feature_width = 4
@@ -225,6 +226,8 @@ class WorldModel(nn.Module):
         self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
         self.imagine_batch_size = -1
         self.imagine_batch_length = -1
+        self._discrete = True
+        self.uwl_eps = uwl_eps
 
         self.encoder = EncoderBN(
             in_channels=in_channels,
@@ -305,7 +308,7 @@ class WorldModel(nn.Module):
             termination_hat = self.termination_decoder(dist_feat)
             termination_hat = termination_hat > 0
 
-        return obs_hat, reward_hat, termination_hat, prior_flattened_sample, dist_feat
+        return obs_hat, reward_hat, termination_hat, prior_flattened_sample, dist_feat, prior_logits
 
     def stright_throught_gradient(self, logits, sample_mode="random_sample"):
         dist = OneHotCategorical(logits=logits)
@@ -337,6 +340,21 @@ class WorldModel(nn.Module):
             self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
             self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
             self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
+            self.confidence_buffer = torch.zeros((*scalar_size, 1), dtype=torch.float32, device="cuda")
+
+    def _latent_confidence(self, prior_logits):
+        if self._discrete:
+            logits = prior_logits.detach()
+            probs = torch.softmax(logits.float(), dim=-1)
+            var = probs * (1.0 - probs)
+            var = var.reshape(var.shape[0], var.shape[1], -1)
+        else:
+            raise NotImplementedError("Continuous latent confidence not implemented")
+
+        var = torch.clamp(var, min=self.uwl_eps)
+        log_var = torch.log(var)
+        confidence = -torch.sum(log_var, dim=-1, keepdim=True)
+        return confidence.detach()
 
     def imagine_data(self, agent: agents.ActorCriticAgent, sample_obs, sample_action,
                      imagine_batch_size, imagine_batch_length, log_video, logger):
@@ -344,10 +362,10 @@ class WorldModel(nn.Module):
         obs_hat_list = []
 
         self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype)
-        # context
+      
         context_latent = self.encode_obs(sample_obs)
-        for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
-            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
+        for i in range(sample_obs.shape[1]): 
+            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat, _ = self.predict_next(
                 context_latent[:, i:i+1],
                 sample_action[:, i:i+1],
                 log_video=log_video
@@ -360,20 +378,28 @@ class WorldModel(nn.Module):
             action = agent.sample(torch.cat([self.latent_buffer[:, i:i+1], self.hidden_buffer[:, i:i+1]], dim=-1))
             self.action_buffer[:, i:i+1] = action
 
-            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
+            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat, prior_logits = self.predict_next(
                 self.latent_buffer[:, i:i+1], self.action_buffer[:, i:i+1], log_video=log_video)
 
             self.latent_buffer[:, i+1:i+2] = last_latent
             self.hidden_buffer[:, i+1:i+2] = last_dist_feat
             self.reward_hat_buffer[:, i:i+1] = last_reward_hat
             self.termination_hat_buffer[:, i:i+1] = last_termination_hat
+            self.confidence_buffer[:, i:i+1] = self._latent_confidence(prior_logits)
             if log_video:
-                obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
+                obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  
 
         if log_video:
             logger.log("Imagine/predict_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
-
-        return torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
+        logger.log("Imagine/latent_confidence_mean", self.confidence_buffer.mean().item())
+        logger.log("Imagine/latent_confidence_std", self.confidence_buffer.std().item())
+        return (
+            torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1),
+            self.action_buffer,
+            self.reward_hat_buffer,
+            self.termination_hat_buffer,
+            self.confidence_buffer
+        )
 
     def update(self, obs, action, reward, termination, logger=None):
         self.train()

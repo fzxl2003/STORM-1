@@ -63,14 +63,14 @@ def world_model_imagine_data(replay_buffer: ReplayBuffer,
 
     sample_obs, sample_action, sample_reward, sample_termination = replay_buffer.sample(
         imagine_batch_size, imagine_demonstration_batch_size, imagine_context_length)
-    latent, action, reward_hat, termination_hat = world_model.imagine_data(
+    latent, action, reward_hat, termination_hat, confidence = world_model.imagine_data(
         agent, sample_obs, sample_action,
         imagine_batch_size=imagine_batch_size+imagine_demonstration_batch_size,
         imagine_batch_length=imagine_batch_length,
         log_video=log_video,
         logger=logger
     )
-    return latent, action, None, None, reward_hat, termination_hat
+    return latent, action, None, None, reward_hat, termination_hat, confidence
 
 
 def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
@@ -156,7 +156,7 @@ def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
             else:
                 log_video = False
 
-            imagine_latent, agent_action, agent_logprob, agent_value, imagine_reward, imagine_termination = world_model_imagine_data(
+            imagine_latent, agent_action, agent_logprob, agent_value, imagine_reward, imagine_termination, imagine_confidence = world_model_imagine_data(
                 replay_buffer=replay_buffer,
                 world_model=world_model,
                 agent=agent,
@@ -175,6 +175,7 @@ def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
                 old_value=agent_value,
                 reward=imagine_reward,
                 termination=imagine_termination,
+                confidence=imagine_confidence,
                 logger=logger
             )
         # <<< train agent part
@@ -193,7 +194,8 @@ def build_world_model(conf, action_dim):
         transformer_max_length=conf.Models.WorldModel.TransformerMaxLength,
         transformer_hidden_dim=conf.Models.WorldModel.TransformerHiddenDim,
         transformer_num_layers=conf.Models.WorldModel.TransformerNumLayers,
-        transformer_num_heads=conf.Models.WorldModel.TransformerNumHeads
+        transformer_num_heads=conf.Models.WorldModel.TransformerNumHeads,
+        uwl_eps=conf.Models.Agent.UWLEps
     ).cuda()
 
 
@@ -206,6 +208,14 @@ def build_agent(conf, action_dim):
         gamma=conf.Models.Agent.Gamma,
         lambd=conf.Models.Agent.Lambda,
         entropy_coef=conf.Models.Agent.EntropyCoef,
+        use_uwl=conf.Models.Agent.UseUncertaintyWeight,
+        weight_type=conf.Models.Agent.WeightType,
+        actor_weight_min=conf.Models.Agent.ActorWeightMin,
+        actor_weight_max=conf.Models.Agent.ActorWeightMax,
+        value_weight_min=conf.Models.Agent.ValueWeightMin,
+        value_weight_max=conf.Models.Agent.ValueWeightMax,
+        uwl_temperature=conf.Models.Agent.UWLTemperature,
+        uwl_eps=conf.Models.Agent.UWLEps
     ).cuda()
 
 
@@ -222,21 +232,47 @@ if __name__ == "__main__":
     parser.add_argument("-seed", type=int, required=True)
     parser.add_argument("-config_path", type=str, required=True)
     parser.add_argument("-env_name", type=str, required=True)
-    parser.add_argument("-trajectory_path", type=str, required=True)
+    parser.add_argument("-trajectory_path", type=str, required=False, default=None,
+                        help="Path to demonstration trajectory for environments like Freeway.")
+    parser.add_argument("--use_uwl", type=int, choices=[0, 1], default=None,
+                        help="Set to 1 to enable uncertainty weighted learning.")
+    parser.add_argument("--weight_type", type=int, choices=[0, 1, 2, 3], default=None,
+                        help="0: disable, 1: actor only, 2: value only, 3: actor and value.")
+    parser.add_argument("--actor_weight_min", type=float, default=None)
+    parser.add_argument("--actor_weight_max", type=float, default=None)
+    parser.add_argument("--value_weight_min", type=float, default=None)
+    parser.add_argument("--value_weight_max", type=float, default=None)
+    parser.add_argument("--uwl_temperature", type=float, default=None)
+    parser.add_argument("--uwl_eps", type=float, default=None)
     args = parser.parse_args()
     conf = load_config(args.config_path)
     print(colorama.Fore.RED + str(args) + colorama.Style.RESET_ALL)
 
-    # set seed
+    conf = conf.clone()
+    conf.defrost()
+    if args.use_uwl is not None:
+        conf.Models.Agent.UseUncertaintyWeight = bool(args.use_uwl)
+    if args.weight_type is not None:
+        conf.Models.Agent.WeightType = args.weight_type
+    if args.actor_weight_min is not None:
+        conf.Models.Agent.ActorWeightMin = args.actor_weight_min
+    if args.actor_weight_max is not None:
+        conf.Models.Agent.ActorWeightMax = args.actor_weight_max
+    if args.value_weight_min is not None:
+        conf.Models.Agent.ValueWeightMin = args.value_weight_min
+    if args.value_weight_max is not None:
+        conf.Models.Agent.ValueWeightMax = args.value_weight_max
+    if args.uwl_temperature is not None:
+        conf.Models.Agent.UWLTemperature = args.uwl_temperature
+    if args.uwl_eps is not None:
+        conf.Models.Agent.UWLEps = args.uwl_eps
+    conf.freeze()
+
     seed_np_torch(seed=args.seed)
-    # tensorboard writer
     logger = Logger(path=f"runs/{args.n}")
-    # copy config file
     shutil.copy(args.config_path, f"runs/{args.n}/config.yaml")
 
-    # distinguish between tasks, other debugging options are removed for simplicity
     if conf.Task == "JointTrainAgent":
-        # getting action_dim with dummy env
         dummy_env = build_single_env(args.env_name, conf.BasicSettings.ImageSize, seed=0)
         action_dim = dummy_env.action_space.n
 
@@ -253,7 +289,6 @@ if __name__ == "__main__":
             store_on_gpu=conf.BasicSettings.ReplayBufferOnGPU
         )
 
-        # judge whether to load demonstration trajectory
         if conf.JointTrainAgent.UseDemonstration:
             print(colorama.Fore.MAGENTA + f"loading demonstration trajectory from {args.trajectory_path}" + colorama.Style.RESET_ALL)
             replay_buffer.load_trajectory(path=args.trajectory_path)

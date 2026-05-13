@@ -84,6 +84,14 @@ def load_config(config_path):
     conf.Models.Agent.Gamma = 1.0
     conf.Models.Agent.Lambda = 0.0
     conf.Models.Agent.EntropyCoef = 0.0
+    conf.Models.Agent.UseUncertaintyWeight = False
+    conf.Models.Agent.WeightType = 0
+    conf.Models.Agent.ActorWeightMin = 0.2
+    conf.Models.Agent.ActorWeightMax = 1.2
+    conf.Models.Agent.ValueWeightMin = 0.2
+    conf.Models.Agent.ValueWeightMax = 1.2
+    conf.Models.Agent.UWLTemperature = 1.0
+    conf.Models.Agent.UWLEps = 1e-8
 
     conf.JointTrainAgent = CN()
     conf.JointTrainAgent.SampleMaxSteps = 0

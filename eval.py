@@ -32,17 +32,18 @@ def process_visualize(img):
     return img
 
 
-def build_single_env(env_name, image_size):
+def build_single_env(env_name, image_size,seed):
     env = gymnasium.make(env_name, full_action_space=False, render_mode="rgb_array", frameskip=1)
+    env = env_wrapper.SeedEnvWrapper(env, seed=seed)
     env = env_wrapper.MaxLast2FrameSkipWrapper(env, skip=4)
     env = gymnasium.wrappers.ResizeObservation(env, shape=image_size)
     return env
 
 
-def build_vec_env(env_name, image_size, num_envs):
+def build_vec_env(env_name, image_size, num_envs,seed):
     # lambda pitfall refs to: https://python.plainenglish.io/python-pitfalls-with-variable-capture-dcfc113f39b7
     def lambda_generator(env_name, image_size):
-        return lambda: build_single_env(env_name, image_size)
+        return lambda: build_single_env(env_name, image_size,seed)
     env_fns = []
     env_fns = [lambda_generator(env_name, image_size) for i in range(num_envs)]
     vec_env = gymnasium.vector.AsyncVectorEnv(env_fns=env_fns)
@@ -50,10 +51,10 @@ def build_vec_env(env_name, image_size, num_envs):
 
 
 def eval_episodes(num_episode, env_name, max_steps, num_envs, image_size,
-                  world_model: WorldModel, agent: agents.ActorCriticAgent):
+                  world_model: WorldModel, agent: agents.ActorCriticAgent, seed=0):
     world_model.eval()
     agent.eval()
-    vec_env = build_vec_env(env_name, image_size, num_envs=num_envs)
+    vec_env = build_vec_env(env_name, image_size, num_envs=num_envs,seed=seed)
     print("Current env: " + colorama.Fore.YELLOW + f"{env_name}" + colorama.Style.RESET_ALL)
     sum_reward = np.zeros(num_envs)
     current_obs, current_info = vec_env.reset()
@@ -113,17 +114,22 @@ if __name__ == "__main__":
     parser.add_argument("-config_path", type=str, required=True)
     parser.add_argument("-env_name", type=str, required=True)
     parser.add_argument("-run_name", type=str, required=True)
+    parser.add_argument("-seed", type=int, default=0)
     args = parser.parse_args()
     conf = load_config(args.config_path)
     print(colorama.Fore.RED + str(args) + colorama.Style.RESET_ALL)
     # print(colorama.Fore.RED + str(conf) + colorama.Style.RESET_ALL)
 
     # set seed
+    print("seed", args.seed)
+    conf.defrost()
+    conf.BasicSettings.Seed = args.seed
+    conf.freeze()
     seed_np_torch(seed=conf.BasicSettings.Seed)
 
     # build and load model/agent
     import train
-    dummy_env = build_single_env(args.env_name, conf.BasicSettings.ImageSize)
+    dummy_env = build_single_env(args.env_name, conf.BasicSettings.ImageSize, seed=conf.BasicSettings.Seed)
     action_dim = dummy_env.action_space.n
     world_model = train.build_world_model(conf, action_dim)
     agent = train.build_agent(conf, action_dim)
@@ -133,7 +139,7 @@ if __name__ == "__main__":
     pathes = glob.glob(f"{root_path}/world_model_*.pth")
     steps = [int(path.split("_")[-1].split(".")[0]) for path in pathes]
     steps.sort()
-    steps = steps[-1:]
+    steps = steps[-3:] 
     print(steps)
     results = []
     for step in tqdm(steps):
@@ -147,9 +153,12 @@ if __name__ == "__main__":
             max_steps=conf.JointTrainAgent.SampleMaxSteps,
             image_size=conf.BasicSettings.ImageSize,
             world_model=world_model,
-            agent=agent
+            agent=agent,
+            seed=args.seed
         )
         results.append([step, episode_avg_return])
+    path=os.path.join("eval_result", f"{args.run_name}.csv")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(f"eval_result/{args.run_name}.csv", "w") as fout:
         fout.write("step, episode_avg_return\n")
         for step, episode_avg_return in results:

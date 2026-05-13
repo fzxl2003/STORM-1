@@ -1,7 +1,8 @@
-env_name=MsPacman
+CUDA_VISIBLE_DEVICES=0 \
 python -u train.py \
-    -n "${env_name}-life_done-wm_2L512D8H-100k-seed1" \
     -seed 1 \
     -config_path "config_files/STORM.yaml" \
-    -env_name "ALE/${env_name}-v5" \
-    -trajectory_path "D_TRAJ/${env_name}.pkl" 
+    -env_name "AmidarNoFrameskip-v4" \
+    --use_uwl 1 \
+    --weight_type 3 \
+    -n "Amidar-v4_seed_1_weight_type_3"

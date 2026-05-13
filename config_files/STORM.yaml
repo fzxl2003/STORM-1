@@ -36,3 +36,11 @@ Models:
     Gamma: 0.985
     Lambda: 0.95
     EntropyCoef: 3E-4
+    UseUncertaintyWeight: True
+    WeightType: 3
+    ActorWeightMin: 0.2
+    ActorWeightMax: 1.2
+    ValueWeightMin: 0.9
+    ValueWeightMax: 1.1
+    UWLTemperature: 1.0
+    UWLEps: 1e-8
