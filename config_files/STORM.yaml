@@ -48,5 +48,6 @@ Models:
     EnsembleSize: 1
     AleatoricCoef: 0.2
     EpistemicCoef: 1.0
+    DecomposedFusionType: "post_tanh"
     UseVarVarEpistemic: True
     UseBootstrapEnsemble: False

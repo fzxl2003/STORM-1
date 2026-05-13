@@ -286,6 +286,7 @@ def build_agent(conf, action_dim):
         aleatoric_coef=conf.Models.Agent.AleatoricCoef,
         epistemic_coef=conf.Models.Agent.EpistemicCoef,
         use_varvar_epistemic=conf.Models.Agent.UseVarVarEpistemic
+        ,decomposed_fusion_type=conf.Models.Agent.DecomposedFusionType
     ).cuda()
 
 
@@ -318,6 +319,7 @@ if __name__ == "__main__":
     parser.add_argument("--ensemble_size", type=int, default=None)
     parser.add_argument("--aleatoric_coef", type=float, default=None)
     parser.add_argument("--epistemic_coef", type=float, default=None)
+    parser.add_argument("--decomposed_fusion_type", type=str, choices=["post_tanh", "pre_tanh_score"], default=None)
     args = parser.parse_args()
     conf = load_config(args.config_path)
     print(colorama.Fore.RED + str(args) + colorama.Style.RESET_ALL)
@@ -348,6 +350,8 @@ if __name__ == "__main__":
         conf.Models.Agent.AleatoricCoef = args.aleatoric_coef
     if args.epistemic_coef is not None:
         conf.Models.Agent.EpistemicCoef = args.epistemic_coef
+    if args.decomposed_fusion_type is not None:
+        conf.Models.Agent.DecomposedFusionType = args.decomposed_fusion_type
     conf.freeze()
 
     seed_np_torch(seed=args.seed)
