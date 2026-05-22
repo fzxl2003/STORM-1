@@ -335,12 +335,14 @@ class WorldModel(nn.Module):
             latent_size = (imagine_batch_size, imagine_batch_length+1, self.stoch_flattened_dim)
             hidden_size = (imagine_batch_size, imagine_batch_length+1, self.transformer_hidden_dim)
             scalar_size = (imagine_batch_size, imagine_batch_length)
-            self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device="cuda")
-            self.hidden_buffer = torch.zeros(hidden_size, dtype=dtype, device="cuda")
-            self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
-            self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
-            self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
-            self.confidence_buffer = torch.zeros((*scalar_size, 1), dtype=torch.float32, device="cuda")
+            device = next(self.parameters()).device
+            self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device=device)
+            self.hidden_buffer = torch.zeros(hidden_size, dtype=dtype, device=device)
+            self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+            self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+            self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+            self.confidence_buffer = torch.zeros((*scalar_size, 1), dtype=torch.float32, device=device)
+            self.latent_var_buffer = torch.zeros((*scalar_size, 1), dtype=torch.float32, device=device)
 
     def _latent_confidence(self, prior_logits):
         if self._discrete:
@@ -355,6 +357,17 @@ class WorldModel(nn.Module):
         log_var = torch.log(var)
         confidence = -torch.sum(log_var, dim=-1, keepdim=True)
         return confidence.detach()
+
+    def _latent_variance_score(self, prior_logits):
+        if self._discrete:
+            logits = prior_logits.detach()
+            probs = torch.softmax(logits.float(), dim=-1)
+            var = probs * (1.0 - probs)
+            var = var.reshape(var.shape[0], var.shape[1], -1)
+            var = torch.clamp(var, min=self.uwl_eps)
+            score = var.mean(dim=-1, keepdim=True)
+            return score.detach()
+        raise NotImplementedError("Continuous latent variance score not implemented")
 
     def imagine_data(self, agent: agents.ActorCriticAgent, sample_obs, sample_action,
                      imagine_batch_size, imagine_batch_length, log_video, logger):
@@ -386,6 +399,7 @@ class WorldModel(nn.Module):
             self.reward_hat_buffer[:, i:i+1] = last_reward_hat
             self.termination_hat_buffer[:, i:i+1] = last_termination_hat
             self.confidence_buffer[:, i:i+1] = self._latent_confidence(prior_logits)
+            self.latent_var_buffer[:, i:i+1] = self._latent_variance_score(prior_logits)
             if log_video:
                 obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  
 
@@ -398,10 +412,11 @@ class WorldModel(nn.Module):
             self.action_buffer,
             self.reward_hat_buffer,
             self.termination_hat_buffer,
-            self.confidence_buffer
+            self.confidence_buffer,
+            self.latent_var_buffer
         )
 
-    def update(self, obs, action, reward, termination, logger=None):
+    def update(self, obs, action, reward, termination, logger=None, suffix=""):
         self.train()
         batch_size, batch_length = obs.shape[:2]
 
@@ -441,11 +456,12 @@ class WorldModel(nn.Module):
         self.optimizer.zero_grad(set_to_none=True)
 
         if logger is not None:
-            logger.log("WorldModel/reconstruction_loss", reconstruction_loss.item())
-            logger.log("WorldModel/reward_loss", reward_loss.item())
-            logger.log("WorldModel/termination_loss", termination_loss.item())
-            logger.log("WorldModel/dynamics_loss", dynamics_loss.item())
-            logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item())
-            logger.log("WorldModel/representation_loss", representation_loss.item())
-            logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
-            logger.log("WorldModel/total_loss", total_loss.item())
+            logger.log(f"WorldModel{suffix}/reconstruction_loss", reconstruction_loss.item())
+            logger.log(f"WorldModel{suffix}/reward_loss", reward_loss.item())
+            logger.log(f"WorldModel{suffix}/termination_loss", termination_loss.item())
+            logger.log(f"WorldModel{suffix}/dynamics_loss", dynamics_loss.item())
+            logger.log(f"WorldModel{suffix}/dynamics_real_kl_div", dynamics_real_kl_div.item())
+            logger.log(f"WorldModel{suffix}/representation_loss", representation_loss.item())
+            logger.log(f"WorldModel{suffix}/representation_real_kl_div", representation_real_kl_div.item())
+            logger.log(f"WorldModel{suffix}/total_loss", total_loss.item())
+        return total_loss
