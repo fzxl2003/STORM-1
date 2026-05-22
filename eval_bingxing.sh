@@ -3,9 +3,9 @@ set -euo pipefail
 
 # 并行评测脚本（适配当前 eval.py 与 run_amidar_parallel.sh 的命名）
 
-CKPT_ROOT="ckpt"
+CKPT_ROOT="/home/pyh/STORM/storm_test/ckpt_ensemble"
 CONFIG_PATH="config_files/STORM.yaml"
-MAX_JOBS=10
+MAX_JOBS=7
 ALLOWED_GPUS="0 1 2 3"
 SLEEP_SECONDS=10
 

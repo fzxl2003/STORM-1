@@ -92,6 +92,13 @@ def load_config(config_path):
     conf.Models.Agent.ValueWeightMax = 1.2
     conf.Models.Agent.UWLTemperature = 1.0
     conf.Models.Agent.UWLEps = 1e-8
+    conf.Models.Agent.UncertaintyMode = "single"
+    conf.Models.Agent.EnsembleSize = 1
+    conf.Models.Agent.AleatoricCoef = 0.2
+    conf.Models.Agent.EpistemicCoef = 1.0
+    conf.Models.Agent.DecomposedFusionType = "post_tanh"
+    conf.Models.Agent.UseVarVarEpistemic = True
+    conf.Models.Agent.UseBootstrapEnsemble = False
 
     conf.JointTrainAgent = CN()
     conf.JointTrainAgent.SampleMaxSteps = 0

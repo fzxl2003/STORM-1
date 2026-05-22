@@ -149,13 +149,13 @@ if __name__ == "__main__":
     world_models = train.build_world_models(conf, action_dim)
     world_model_list = [world_models] if conf.Models.Agent.UncertaintyMode == "single" else list(world_models)
     agent = train.build_agent(conf, action_dim)
-    root_path = f"ckpt/{args.run_name}"
+    root_path = f"ckpt_ensemble/{args.run_name}"
 
     import glob
     pathes = glob.glob(f"{root_path}/world_model_*.pth")
     steps = [int(path.split("_")[-1].split(".")[0]) for path in pathes]
     steps.sort()
-    steps = steps[-3:] 
+    # steps = steps[-3:] 
     print(steps)
     results = []
     for step in tqdm(steps):

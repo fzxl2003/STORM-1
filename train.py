@@ -129,7 +129,7 @@ def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
                                   imagine_context_length, imagine_batch_length,
                                   save_every_steps, seed, logger, uncertainty_mode="single", use_bootstrap_ensemble=False):
     # create ckpt dir
-    os.makedirs(f"ckpt/{args.n}", exist_ok=True)
+    os.makedirs(f"ckpt_ensemble/{args.n}", exist_ok=True)
 
     # build vec env, not useful in the Atari100k setting
     # but when the max_steps is large, you can use parallel envs to speed up
@@ -237,14 +237,14 @@ def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
         if total_steps % (save_every_steps//num_envs) == 0:
             print(colorama.Fore.GREEN + f"Saving model at total steps {total_steps}" + colorama.Style.RESET_ALL)
             if uncertainty_mode == "single":
-                torch.save(world_model.state_dict(), f"ckpt/{args.n}/world_model_{total_steps}.pth")
+                torch.save(world_model.state_dict(), f"ckpt_ensemble/{args.n}/world_model_{total_steps}.pth")
             else:
                 ckpt = {
                     "world_models": [wm.state_dict() for wm in world_model],
                     "world_model_optimizers": [wm.optimizer.state_dict() for wm in world_model]
                 }
-                torch.save(ckpt, f"ckpt/{args.n}/world_model_{total_steps}.pth")
-            torch.save(agent.state_dict(), f"ckpt/{args.n}/agent_{total_steps}.pth")
+                torch.save(ckpt, f"ckpt_ensemble/{args.n}/world_model_{total_steps}.pth")
+            torch.save(agent.state_dict(), f"ckpt_ensemble/{args.n}/agent_{total_steps}.pth")
 
 
 def build_world_model(conf, action_dim):
@@ -355,8 +355,8 @@ if __name__ == "__main__":
     conf.freeze()
 
     seed_np_torch(seed=args.seed)
-    logger = Logger(path=f"runs/{args.n}")
-    shutil.copy(args.config_path, f"runs/{args.n}/config.yaml")
+    logger = Logger(path=f"runs_ensemble/{args.n}")
+    shutil.copy(args.config_path, f"runs_ensemble/{args.n}/config.yaml")
 
     if conf.Task == "JointTrainAgent":
         dummy_env = build_single_env(args.env_name, conf.BasicSettings.ImageSize, seed=0)
