@@ -131,7 +131,9 @@ if __name__ == "__main__":
     import train
     dummy_env = build_single_env(args.env_name, conf.BasicSettings.ImageSize, seed=conf.BasicSettings.Seed)
     action_dim = dummy_env.action_space.n
-    world_model = train.build_world_model(conf, action_dim)
+    world_models = train.build_world_models(conf, action_dim)
+    # Eval only needs one rollout model; in ensemble mode use the first member.
+    world_model = world_models if conf.Models.Agent.UncertaintyMode == "single" else world_models[0]
     agent = train.build_agent(conf, action_dim)
     root_path = f"ckpt/{args.run_name}"
 
@@ -143,7 +145,23 @@ if __name__ == "__main__":
     print(steps)
     results = []
     for step in tqdm(steps):
-        world_model.load_state_dict(torch.load(f"{root_path}/world_model_{step}.pth"))
+        wm_ckpt = torch.load(f"{root_path}/world_model_{step}.pth")
+        if isinstance(wm_ckpt, dict) and "world_models" in wm_ckpt:
+            if conf.Models.Agent.UncertaintyMode != "ensemble_decomposed":
+                raise ValueError(
+                    "Found ensemble world-model checkpoint, but config UncertaintyMode is not ensemble_decomposed."
+                )
+            if len(wm_ckpt["world_models"]) != conf.Models.Agent.EnsembleSize:
+                raise ValueError(
+                    f"Ensemble size mismatch: ckpt has {len(wm_ckpt['world_models'])}, "
+                    f"config has {conf.Models.Agent.EnsembleSize}."
+                )
+            # Load all ensemble members for compatibility with new checkpoints.
+            for wm, wm_state in zip(world_models, wm_ckpt["world_models"]):
+                wm.load_state_dict(wm_state)
+        else:
+            # Backward-compatible single world-model checkpoint loading.
+            world_model.load_state_dict(wm_ckpt)
         agent.load_state_dict(torch.load(f"{root_path}/agent_{step}.pth"))
         # # eval
         episode_avg_return = eval_episodes(
