@@ -2,15 +2,15 @@
 set -euo pipefail
 
 # --- 用户配置区 ---
-ALLOWED_GPUS="0 1 2 4 5 6 7"
-MAX_PARALLEL_JOBS=7
+ALLOWED_GPUS="5 6 3 4 7"
+MAX_PARALLEL_JOBS=4
 IGNORED_THREADS=""
 GPU_SELECTION_MODE="PROCESS" # PROCESS | ROUND_ROBIN
 
 # 可按需调整
 CONFIG_PATH="config_files/STORM.yaml"
-ENV_NAME="PongNoFrameskip-v4"
-TRAJECTORY_PATH="D_TRAJ/QbertNoFrameskip-v4.pkl"
+ENV_NAME="BattleZoneNoFrameskip-v4"
+TRAJECTORY_PATH="D_TRAJ/BattleZoneNoFrameskip-v4.pkl"
 
 # 三组实验 × seed 1~5
 EXPERIMENTS=(

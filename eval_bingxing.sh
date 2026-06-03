@@ -5,8 +5,8 @@ set -euo pipefail
 
 CKPT_ROOT="/home/pyh/STORM/storm_test/ckpt_ensemble"
 CONFIG_PATH="config_files/STORM.yaml"
-MAX_JOBS=7
-ALLOWED_GPUS="0 1 2 3"
+MAX_JOBS=5
+ALLOWED_GPUS="0 1 2 3 4 5 6 7"
 SLEEP_SECONDS=10
 
 GPU_ARRAY=($ALLOWED_GPUS)
@@ -15,6 +15,10 @@ GPU_INDEX=0
 
 ckpt_path=()
 while IFS= read -r line; do
+  #带有abc字样的跳过
+    if [[ "$line" != *"UpNDown"* ]]; then
+        continue
+    fi
     ckpt_path+=("$line")
 done < <(find "$CKPT_ROOT" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | sort)
 

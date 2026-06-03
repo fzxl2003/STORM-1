@@ -126,6 +126,7 @@ if __name__ == "__main__":
     parser.add_argument("-run_name", type=str, required=True)
     parser.add_argument("-seed", type=int, default=0)
     parser.add_argument("--uncertainty_mode", type=str, choices=["single", "ensemble_decomposed"], default=None)
+    # parser.add_argument("--ensemblesize",type=int,default=None)
     args = parser.parse_args()
     conf = load_config(args.config_path)
     print(colorama.Fore.RED + str(args) + colorama.Style.RESET_ALL)
@@ -139,6 +140,11 @@ if __name__ == "__main__":
         conf.Models.Agent.UncertaintyMode = args.uncertainty_mode
     else:
         conf.Models.Agent.UncertaintyMode = infer_uncertainty_mode_from_run_name(args.run_name)
+    if conf.Models.Agent.UncertaintyMode != "ensemble_decomposed":
+        conf.Models.Agent.EnsembleSize = 1
+    else:
+        conf.Models.Agent.EnsembleSize = 4
+
     conf.freeze()
     seed_np_torch(seed=conf.BasicSettings.Seed)
 
@@ -165,7 +171,7 @@ if __name__ == "__main__":
                 raise ValueError(
                     "Found ensemble world-model checkpoint, but config UncertaintyMode is not ensemble_decomposed."
                 )
-            if len(wm_ckpt["world_models"]) != conf.Models.Agent.EnsembleSize:
+            if len(wm_ckpt["world_models"]) != conf.Models.Agent.EnsembleSize :
                 raise ValueError(
                     f"Ensemble size mismatch: ckpt has {len(wm_ckpt['world_models'])}, "
                     f"config has {conf.Models.Agent.EnsembleSize}."
