@@ -44,45 +44,92 @@ def build_vec_env(env_name, image_size, num_envs, seed):
     return vec_env
 
 
-def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel, batch_size, demonstration_batch_size, batch_length, logger):
+def _bootstrap_batch(obs, action, reward, termination):
+    b = obs.shape[0]
+    idx = torch.randint(0, b, (b,), device=obs.device)
+    return obs[idx], action[idx], reward[idx], termination[idx]
+
+
+def train_world_model_step(replay_buffer: ReplayBuffer, world_model, batch_size, demonstration_batch_size,
+                           batch_length, logger, uncertainty_mode="single", use_bootstrap_ensemble=False):
     obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length)
-    world_model.update(obs, action, reward, termination, logger=logger)
+    if uncertainty_mode == "single":
+        world_model.update(obs, action, reward, termination, logger=logger)
+    else:
+        wm_losses = []
+        for k, wm in enumerate(world_model):
+            obs_k, action_k, reward_k, termination_k = obs, action, reward, termination
+            if use_bootstrap_ensemble:
+                obs_k, action_k, reward_k, termination_k = _bootstrap_batch(obs, action, reward, termination)
+            loss_k = wm.update(obs_k, action_k, reward_k, termination_k, logger=logger, suffix=f"/ensemble_{k}")
+            wm_losses.append(loss_k.detach())
+            logger.log(f"WorldModel/ensemble_{k}/loss", loss_k.item())
+        logger.log("WorldModel/ensemble_loss_mean", torch.stack(wm_losses).mean().item())
 
 
 @torch.no_grad()
 def world_model_imagine_data(replay_buffer: ReplayBuffer,
-                             world_model: WorldModel, agent: agents.ActorCriticAgent,
+                             world_model, agent: agents.ActorCriticAgent,
                              imagine_batch_size, imagine_demonstration_batch_size,
                              imagine_context_length, imagine_batch_length,
-                             log_video, logger):
+                             log_video, logger, uncertainty_mode="single"):
     '''
     Sample context from replay buffer, then imagine data with world model and agent
     '''
-    world_model.eval()
+    if uncertainty_mode == "single":
+        world_model.eval()
+    else:
+        for wm in world_model:
+            wm.eval()
     agent.eval()
 
     sample_obs, sample_action, sample_reward, sample_termination = replay_buffer.sample(
         imagine_batch_size, imagine_demonstration_batch_size, imagine_context_length)
-    latent, action, reward_hat, termination_hat, confidence = world_model.imagine_data(
-        agent, sample_obs, sample_action,
-        imagine_batch_size=imagine_batch_size+imagine_demonstration_batch_size,
-        imagine_batch_length=imagine_batch_length,
-        log_video=log_video,
-        logger=logger
-    )
-    return latent, action, None, None, reward_hat, termination_hat, confidence
+    if uncertainty_mode == "single":
+        latent, action, reward_hat, termination_hat, confidence, _ = world_model.imagine_data(
+            agent, sample_obs, sample_action,
+            imagine_batch_size=imagine_batch_size+imagine_demonstration_batch_size,
+            imagine_batch_length=imagine_batch_length,
+            log_video=log_video,
+            logger=logger
+        )
+        return latent, action, None, None, reward_hat, termination_hat, confidence, None, None
+    # Ensemble decomposed IUPOM branch
+    outputs = []
+    latent_var_scores = []
+    for k, wm in enumerate(world_model):
+        out_k = wm.imagine_data(agent, sample_obs, sample_action,
+                                imagine_batch_size=imagine_batch_size+imagine_demonstration_batch_size,
+                                imagine_batch_length=imagine_batch_length,
+                                log_video=(log_video and k == 0), logger=logger)
+        outputs.append(out_k)
+        latent_var_scores.append(out_k[5])
+    var_scores = torch.stack(latent_var_scores, dim=0)
+    assert var_scores.shape[0] == len(world_model) and var_scores.shape[-1] == 1, f"bad var_scores: {var_scores.shape}"
+    alea_uncertainty = var_scores.mean(dim=0)
+    epi_uncertainty = var_scores.var(dim=0, unbiased=False)
+    assert alea_uncertainty.shape == var_scores.shape[1:], "alea shape mismatch"
+    assert epi_uncertainty.shape == var_scores.shape[1:], "epi shape mismatch"
+    logger.log("Imagine/ensemble_var_score_mean", var_scores.mean().item())
+    logger.log("Imagine/ensemble_var_score_std", var_scores.std(unbiased=False).item())
+    logger.log("Imagine/alea_uncertainty_mean", alea_uncertainty.mean().item())
+    logger.log("Imagine/alea_uncertainty_std", alea_uncertainty.std(unbiased=False).item())
+    logger.log("Imagine/epi_uncertainty_mean", epi_uncertainty.mean().item())
+    logger.log("Imagine/epi_uncertainty_std", epi_uncertainty.std(unbiased=False).item())
+    base_out = outputs[0]
+    return base_out[0], base_out[1], None, None, base_out[2], base_out[3], base_out[4], alea_uncertainty, epi_uncertainty
 
 
 def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
                                   replay_buffer: ReplayBuffer,
-                                  world_model: WorldModel, agent: agents.ActorCriticAgent,
+                                  world_model, agent: agents.ActorCriticAgent,
                                   train_dynamics_every_steps, train_agent_every_steps,
                                   batch_size, demonstration_batch_size, batch_length,
                                   imagine_batch_size, imagine_demonstration_batch_size,
                                   imagine_context_length, imagine_batch_length,
-                                  save_every_steps, seed, logger):
+                                  save_every_steps, seed, logger, uncertainty_mode="single", use_bootstrap_ensemble=False):
     # create ckpt dir
-    os.makedirs(f"ckpt/{args.n}", exist_ok=True)
+    os.makedirs(f"ckpt_ensemble/{args.n}", exist_ok=True)
 
     # build vec env, not useful in the Atari100k setting
     # but when the max_steps is large, you can use parallel envs to speed up
@@ -105,10 +152,11 @@ def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
                 if len(context_action) == 0:
                     action = vec_env.action_space.sample()
                 else:
-                    context_latent = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
+                    wm_for_act = world_model if uncertainty_mode == "single" else world_model[0]
+                    context_latent = wm_for_act.encode_obs(torch.cat(list(context_obs), dim=1))
                     model_context_action = np.stack(list(context_action), axis=1)
                     model_context_action = torch.Tensor(model_context_action).cuda()
-                    prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
+                    prior_flattened_sample, last_dist_feat = wm_for_act.calc_last_dist_feat(context_latent, model_context_action)
                     action = agent.sample_as_env_action(
                         torch.cat([prior_flattened_sample, last_dist_feat], dim=-1),
                         greedy=False
@@ -145,7 +193,9 @@ def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
                 batch_size=batch_size,
                 demonstration_batch_size=demonstration_batch_size,
                 batch_length=batch_length,
-                logger=logger
+                logger=logger,
+                uncertainty_mode=uncertainty_mode,
+                use_bootstrap_ensemble=use_bootstrap_ensemble
             )
         # <<< train world model part
 
@@ -156,7 +206,7 @@ def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
             else:
                 log_video = False
 
-            imagine_latent, agent_action, agent_logprob, agent_value, imagine_reward, imagine_termination, imagine_confidence = world_model_imagine_data(
+            imagine_latent, agent_action, agent_logprob, agent_value, imagine_reward, imagine_termination, imagine_confidence, imagine_alea_uncertainty, imagine_epi_uncertainty = world_model_imagine_data(
                 replay_buffer=replay_buffer,
                 world_model=world_model,
                 agent=agent,
@@ -165,7 +215,8 @@ def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
                 imagine_context_length=imagine_context_length,
                 imagine_batch_length=imagine_batch_length,
                 log_video=log_video,
-                logger=logger
+                logger=logger,
+                uncertainty_mode=uncertainty_mode
             )
 
             agent.update(
@@ -176,6 +227,8 @@ def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
                 reward=imagine_reward,
                 termination=imagine_termination,
                 confidence=imagine_confidence,
+                alea_uncertainty=imagine_alea_uncertainty,
+                epi_uncertainty=imagine_epi_uncertainty,
                 logger=logger
             )
         # <<< train agent part
@@ -183,8 +236,15 @@ def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
         # save model per episode
         if total_steps % (save_every_steps//num_envs) == 0:
             print(colorama.Fore.GREEN + f"Saving model at total steps {total_steps}" + colorama.Style.RESET_ALL)
-            torch.save(world_model.state_dict(), f"ckpt/{args.n}/world_model_{total_steps}.pth")
-            torch.save(agent.state_dict(), f"ckpt/{args.n}/agent_{total_steps}.pth")
+            if uncertainty_mode == "single":
+                torch.save(world_model.state_dict(), f"ckpt_ensemble/{args.n}/world_model_{total_steps}.pth")
+            else:
+                ckpt = {
+                    "world_models": [wm.state_dict() for wm in world_model],
+                    "world_model_optimizers": [wm.optimizer.state_dict() for wm in world_model]
+                }
+                torch.save(ckpt, f"ckpt_ensemble/{args.n}/world_model_{total_steps}.pth")
+            torch.save(agent.state_dict(), f"ckpt_ensemble/{args.n}/agent_{total_steps}.pth")
 
 
 def build_world_model(conf, action_dim):
@@ -197,6 +257,12 @@ def build_world_model(conf, action_dim):
         transformer_num_heads=conf.Models.WorldModel.TransformerNumHeads,
         uwl_eps=conf.Models.Agent.UWLEps
     ).cuda()
+
+
+def build_world_models(conf, action_dim):
+    if conf.Models.Agent.UncertaintyMode == "single":
+        return build_world_model(conf, action_dim)
+    return nn.ModuleList([build_world_model(conf, action_dim) for _ in range(conf.Models.Agent.EnsembleSize)])
 
 
 def build_agent(conf, action_dim):
@@ -215,7 +281,12 @@ def build_agent(conf, action_dim):
         value_weight_min=conf.Models.Agent.ValueWeightMin,
         value_weight_max=conf.Models.Agent.ValueWeightMax,
         uwl_temperature=conf.Models.Agent.UWLTemperature,
-        uwl_eps=conf.Models.Agent.UWLEps
+        uwl_eps=conf.Models.Agent.UWLEps,
+        uncertainty_mode=conf.Models.Agent.UncertaintyMode,
+        aleatoric_coef=conf.Models.Agent.AleatoricCoef,
+        epistemic_coef=conf.Models.Agent.EpistemicCoef,
+        use_varvar_epistemic=conf.Models.Agent.UseVarVarEpistemic
+        ,decomposed_fusion_type=conf.Models.Agent.DecomposedFusionType
     ).cuda()
 
 
@@ -244,6 +315,11 @@ if __name__ == "__main__":
     parser.add_argument("--value_weight_max", type=float, default=None)
     parser.add_argument("--uwl_temperature", type=float, default=None)
     parser.add_argument("--uwl_eps", type=float, default=None)
+    parser.add_argument("--uncertainty_mode", type=str, choices=["single", "ensemble_decomposed"], default=None)
+    parser.add_argument("--ensemble_size", type=int, default=None)
+    parser.add_argument("--aleatoric_coef", type=float, default=None)
+    parser.add_argument("--epistemic_coef", type=float, default=None)
+    parser.add_argument("--decomposed_fusion_type", type=str, choices=["post_tanh", "pre_tanh_score"], default=None)
     args = parser.parse_args()
     conf = load_config(args.config_path)
     print(colorama.Fore.RED + str(args) + colorama.Style.RESET_ALL)
@@ -266,18 +342,28 @@ if __name__ == "__main__":
         conf.Models.Agent.UWLTemperature = args.uwl_temperature
     if args.uwl_eps is not None:
         conf.Models.Agent.UWLEps = args.uwl_eps
+    if args.uncertainty_mode is not None:
+        conf.Models.Agent.UncertaintyMode = args.uncertainty_mode
+    if args.ensemble_size is not None:
+        conf.Models.Agent.EnsembleSize = args.ensemble_size
+    if args.aleatoric_coef is not None:
+        conf.Models.Agent.AleatoricCoef = args.aleatoric_coef
+    if args.epistemic_coef is not None:
+        conf.Models.Agent.EpistemicCoef = args.epistemic_coef
+    if args.decomposed_fusion_type is not None:
+        conf.Models.Agent.DecomposedFusionType = args.decomposed_fusion_type
     conf.freeze()
 
     seed_np_torch(seed=args.seed)
-    logger = Logger(path=f"runs/{args.n}")
-    shutil.copy(args.config_path, f"runs/{args.n}/config.yaml")
+    logger = Logger(path=f"runs_ensemble/{args.n}")
+    shutil.copy(args.config_path, f"runs_ensemble/{args.n}/config.yaml")
 
     if conf.Task == "JointTrainAgent":
         dummy_env = build_single_env(args.env_name, conf.BasicSettings.ImageSize, seed=0)
         action_dim = dummy_env.action_space.n
 
         # build world model and agent
-        world_model = build_world_model(conf, action_dim)
+        world_model = build_world_models(conf, action_dim)
         agent = build_agent(conf, action_dim)
 
         # build replay buffer
@@ -313,7 +399,9 @@ if __name__ == "__main__":
             imagine_batch_length=conf.JointTrainAgent.ImagineBatchLength,
             save_every_steps=conf.JointTrainAgent.SaveEverySteps,
             seed=args.seed,
-            logger=logger
+            logger=logger,
+            uncertainty_mode=conf.Models.Agent.UncertaintyMode,
+            use_bootstrap_ensemble=conf.Models.Agent.UseBootstrapEnsemble
         )
     else:
         raise NotImplementedError(f"Task {conf.Task} not implemented")

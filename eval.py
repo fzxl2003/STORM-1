@@ -25,6 +25,16 @@ from sub_models.functions_losses import symexp
 from sub_models.world_models import WorldModel, MSELoss
 
 
+def infer_uncertainty_mode_from_run_name(run_name):
+    # Match naming tags created by run_amidar_parallel.sh:
+    #   *_baseline / *_iupom -> single
+    #   *_ens_post_tanh      -> ensemble_decomposed
+    lower_name = run_name.lower()
+    if "ens_post_tanh" in lower_name:
+        return "ensemble_decomposed"
+    return "single"
+
+
 def process_visualize(img):
     img = img.astype('uint8')
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
@@ -115,6 +125,8 @@ if __name__ == "__main__":
     parser.add_argument("-env_name", type=str, required=True)
     parser.add_argument("-run_name", type=str, required=True)
     parser.add_argument("-seed", type=int, default=0)
+    parser.add_argument("--uncertainty_mode", type=str, choices=["single", "ensemble_decomposed"], default=None)
+    # parser.add_argument("--ensemblesize",type=int,default=None)
     args = parser.parse_args()
     conf = load_config(args.config_path)
     print(colorama.Fore.RED + str(args) + colorama.Style.RESET_ALL)
@@ -124,6 +136,15 @@ if __name__ == "__main__":
     print("seed", args.seed)
     conf.defrost()
     conf.BasicSettings.Seed = args.seed
+    if args.uncertainty_mode is not None:
+        conf.Models.Agent.UncertaintyMode = args.uncertainty_mode
+    else:
+        conf.Models.Agent.UncertaintyMode = infer_uncertainty_mode_from_run_name(args.run_name)
+    if conf.Models.Agent.UncertaintyMode != "ensemble_decomposed":
+        conf.Models.Agent.EnsembleSize = 1
+    else:
+        conf.Models.Agent.EnsembleSize = 4
+
     conf.freeze()
     seed_np_torch(seed=conf.BasicSettings.Seed)
 
@@ -131,31 +152,53 @@ if __name__ == "__main__":
     import train
     dummy_env = build_single_env(args.env_name, conf.BasicSettings.ImageSize, seed=conf.BasicSettings.Seed)
     action_dim = dummy_env.action_space.n
-    world_model = train.build_world_model(conf, action_dim)
+    world_models = train.build_world_models(conf, action_dim)
+    world_model_list = [world_models] if conf.Models.Agent.UncertaintyMode == "single" else list(world_models)
     agent = train.build_agent(conf, action_dim)
-    root_path = f"ckpt/{args.run_name}"
+    root_path = f"ckpt_ensemble/{args.run_name}"
 
     import glob
     pathes = glob.glob(f"{root_path}/world_model_*.pth")
     steps = [int(path.split("_")[-1].split(".")[0]) for path in pathes]
     steps.sort()
-    steps = steps[-3:] 
+    # steps = steps[-3:] 
     print(steps)
     results = []
     for step in tqdm(steps):
-        world_model.load_state_dict(torch.load(f"{root_path}/world_model_{step}.pth"))
+        wm_ckpt = torch.load(f"{root_path}/world_model_{step}.pth")
+        if isinstance(wm_ckpt, dict) and "world_models" in wm_ckpt:
+            if conf.Models.Agent.UncertaintyMode != "ensemble_decomposed":
+                raise ValueError(
+                    "Found ensemble world-model checkpoint, but config UncertaintyMode is not ensemble_decomposed."
+                )
+            if len(wm_ckpt["world_models"]) != conf.Models.Agent.EnsembleSize :
+                raise ValueError(
+                    f"Ensemble size mismatch: ckpt has {len(wm_ckpt['world_models'])}, "
+                    f"config has {conf.Models.Agent.EnsembleSize}."
+                )
+            # Load all ensemble members for compatibility with new checkpoints.
+            for wm, wm_state in zip(world_models, wm_ckpt["world_models"]):
+                wm.load_state_dict(wm_state)
+        else:
+            # Backward-compatible single world-model checkpoint loading.
+            world_models.load_state_dict(wm_ckpt)
         agent.load_state_dict(torch.load(f"{root_path}/agent_{step}.pth"))
-        # # eval
-        episode_avg_return = eval_episodes(
-            num_episode=20,
-            env_name=args.env_name,
-            num_envs=5,
-            max_steps=conf.JointTrainAgent.SampleMaxSteps,
-            image_size=conf.BasicSettings.ImageSize,
-            world_model=world_model,
-            agent=agent,
-            seed=args.seed
-        )
+        # Eval each ensemble member independently and keep the best score.
+        member_scores = []
+        for wm in world_model_list:
+            episode_avg_return = eval_episodes(
+                num_episode=20,
+                env_name=args.env_name,
+                num_envs=5,
+                max_steps=conf.JointTrainAgent.SampleMaxSteps,
+                image_size=conf.BasicSettings.ImageSize,
+                world_model=wm,
+                agent=agent,
+                seed=args.seed
+            )
+            member_scores.append(episode_avg_return)
+        episode_avg_return = max(member_scores)
+        print("Best member reward: " + colorama.Fore.YELLOW + f"{episode_avg_return}" + colorama.Style.RESET_ALL)
         results.append([step, episode_avg_return])
     path=os.path.join("eval_result", f"{args.run_name}.csv")
     os.makedirs(os.path.dirname(path), exist_ok=True)

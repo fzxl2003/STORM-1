@@ -39,7 +39,9 @@ class ActorCriticAgent(nn.Module):
                  use_uwl=False, weight_type=0,
                  actor_weight_min=0.2, actor_weight_max=1.2,
                  value_weight_min=0.2, value_weight_max=1.2,
-                 uwl_temperature=1.0, uwl_eps=1e-8) -> None:
+                 uwl_temperature=1.0, uwl_eps=1e-8,
+                 uncertainty_mode="single", aleatoric_coef=0.2, epistemic_coef=1.0,
+                 use_varvar_epistemic=True, decomposed_fusion_type="post_tanh") -> None:
         super().__init__()
         self.gamma = gamma
         self.lambd = lambd
@@ -54,10 +56,20 @@ class ActorCriticAgent(nn.Module):
         self.value_weight_max = value_weight_max
         self.uwl_temperature = uwl_temperature
         self.uwl_eps = uwl_eps
+        self.uncertainty_mode = uncertainty_mode
+        self.aleatoric_coef = aleatoric_coef
+        self.epistemic_coef = epistemic_coef
+        self.use_varvar_epistemic = use_varvar_epistemic
+        self.decomposed_fusion_type = decomposed_fusion_type
         print(f'ActorCriticAgent use_uwl: {self.use_uwl}, weight_type: {self.weight_type}')
         print(f'Actor weight range: [{self.actor_weight_min}, {self.actor_weight_max}]')
         print(f'Value weight range: [{self.value_weight_min}, {self.value_weight_max}]')
         print(f'UWL temperature: {self.uwl_temperature}, eps: {self.uwl_eps}')
+        print(f'UncertaintyMode: {self.uncertainty_mode}')
+        print(f'AleatoricCoef: {self.aleatoric_coef}')
+        print(f'EpistemicCoef: {self.epistemic_coef}')
+        print(f'UseVarVarEpistemic: {self.use_varvar_epistemic}')
+        print(f'DecomposedFusionType: {self.decomposed_fusion_type}')
 
         self.symlog_twohot_loss = SymLogTwoHotLoss(255, -20, 20)
 
@@ -137,6 +149,52 @@ class ActorCriticAgent(nn.Module):
             value_weights = None
         return actor_weights, value_weights
 
+    def _normalize_uncertainty(self, x, eps=None):
+        if eps is None:
+            eps = self.uwl_eps
+        flat = x.reshape(-1, x.shape[-1])
+        mean = flat.mean(dim=0, keepdim=True)
+        std = flat.std(dim=0, unbiased=False, keepdim=True).clamp(min=eps)
+        normalized = (flat - mean) / std
+        return normalized.reshape_as(x)
+
+    def _compute_decomposed_score_linear(self, alea_uncertainty, epi_uncertainty):
+        alea_norm = self._normalize_uncertainty(alea_uncertainty)
+        epi_norm = self._normalize_uncertainty(epi_uncertainty)
+        score = - self.aleatoric_coef * alea_norm - self.epistemic_coef * epi_norm
+        return score.detach()
+
+    def _compute_iupom_style_confidence_from_uncertainty(self, uncertainty):
+        uncertainty = torch.clamp(uncertainty, min=self.uwl_eps)
+        flat = uncertainty.reshape(-1, uncertainty.shape[-1])
+        mean = flat.mean(dim=0, keepdim=True)
+        std = flat.std(dim=0, unbiased=False, keepdim=True).clamp(min=self.uwl_eps)
+        norm_uncertainty = ((flat - mean) / std).reshape_as(uncertainty)
+        positive_uncertainty = F.softplus(norm_uncertainty) + self.uwl_eps
+        confidence = -torch.log(positive_uncertainty).sum(dim=-1, keepdim=True)
+        return confidence.detach()
+
+    def _compute_decomposed_weights_iupom_style(self, alea_uncertainty, epi_uncertainty):
+        assert alea_uncertainty.shape == epi_uncertainty.shape and alea_uncertainty.shape[-1] == 1
+        alea_confidence = self._compute_iupom_style_confidence_from_uncertainty(alea_uncertainty)
+        epi_confidence = self._compute_iupom_style_confidence_from_uncertainty(epi_uncertainty)
+        assert alea_confidence.shape == alea_uncertainty.shape
+        assert epi_confidence.shape == epi_uncertainty.shape
+
+        alea_actor_w, alea_value_w = self._compute_weights(alea_confidence)
+        epi_actor_w, epi_value_w = self._compute_weights(epi_confidence)
+        denom = self.aleatoric_coef + self.epistemic_coef + self.uwl_eps
+
+        actor_weights = None
+        value_weights = None
+        if alea_actor_w is not None and epi_actor_w is not None:
+            actor_weights = (self.aleatoric_coef * alea_actor_w + self.epistemic_coef * epi_actor_w) / denom
+            assert actor_weights.shape == alea_actor_w.shape == epi_actor_w.shape
+        if alea_value_w is not None and epi_value_w is not None:
+            value_weights = (self.aleatoric_coef * alea_value_w + self.epistemic_coef * epi_value_w) / denom
+            assert value_weights.shape == alea_value_w.shape == epi_value_w.shape
+        return actor_weights, value_weights, alea_confidence, epi_confidence, alea_actor_w, epi_actor_w, alea_value_w, epi_value_w
+
     def _weighted_mean(self, tensor, weights):
         weights = weights.to(tensor.dtype)
         total_weight = torch.clamp(weights.sum(), min=1e-6)
@@ -183,7 +241,8 @@ class ActorCriticAgent(nn.Module):
         action = self.sample(latent, greedy)
         return action.detach().cpu().squeeze(-1).numpy()
 
-    def update(self, latent, action, old_logprob, old_value, reward, termination, confidence=None, logger=None):
+    def update(self, latent, action, old_logprob, old_value, reward, termination, confidence=None,
+               alea_uncertainty=None, epi_uncertainty=None, logger=None):
         '''
         Update policy and value model
         '''
@@ -202,8 +261,32 @@ class ActorCriticAgent(nn.Module):
 
             actor_weights = None
             value_weights = None
-            if self.use_uwl and confidence is not None:
-                actor_weights, value_weights = self._compute_weights(confidence)
+            decomposed_score = None
+            alea_confidence = None
+            epi_confidence = None
+            alea_actor_w = epi_actor_w = None
+            alea_value_w = epi_value_w = None
+            if self.use_uwl:
+                if self.uncertainty_mode == "single":
+                    # Original IUPOM branch
+                    if confidence is not None:
+                        actor_weights, value_weights = self._compute_weights(confidence)
+                elif self.uncertainty_mode == "ensemble_decomposed":
+                    # Ensemble decomposed IUPOM branch
+                    assert alea_uncertainty is not None, "alea_uncertainty is required in ensemble_decomposed mode"
+                    assert epi_uncertainty is not None, "epi_uncertainty is required in ensemble_decomposed mode"
+                    assert alea_uncertainty.ndim == 3 and epi_uncertainty.ndim == 3, "Expected [B, T, 1]"
+                    assert alea_uncertainty.shape[-1] == 1 and epi_uncertainty.shape[-1] == 1, "Expected [B, T, 1]"
+                    if self.decomposed_fusion_type == "post_tanh":
+                        actor_weights, value_weights, alea_confidence, epi_confidence, alea_actor_w, epi_actor_w, alea_value_w, epi_value_w = \
+                            self._compute_decomposed_weights_iupom_style(alea_uncertainty, epi_uncertainty)
+                    elif self.decomposed_fusion_type == "pre_tanh_score":
+                        decomposed_score = self._compute_decomposed_score_linear(alea_uncertainty, epi_uncertainty)
+                        actor_weights, value_weights = self._compute_weights(decomposed_score)
+                    else:
+                        raise ValueError(f"Unknown decomposed fusion type: {self.decomposed_fusion_type}")
+                else:
+                    raise ValueError(f"Unknown uncertainty mode: {self.uncertainty_mode}")
                 if actor_weights is not None:
                     actor_weights = actor_weights.squeeze(-1)
                 if value_weights is not None:
@@ -257,3 +340,30 @@ class ActorCriticAgent(nn.Module):
                 logger.log('ActorCritic/actor_weight_mean', actor_weights.mean().item())
             if value_weights is not None:
                 logger.log('ActorCritic/value_weight_mean', value_weights.mean().item())
+            if alea_uncertainty is not None:
+                logger.log('ActorCritic/alea_uncertainty_mean', alea_uncertainty.mean().item())
+                logger.log('ActorCritic/alea_uncertainty_std', alea_uncertainty.std(unbiased=False).item())
+            if epi_uncertainty is not None:
+                logger.log('ActorCritic/epi_uncertainty_mean', epi_uncertainty.mean().item())
+                logger.log('ActorCritic/epi_uncertainty_std', epi_uncertainty.std(unbiased=False).item())
+            if alea_confidence is not None:
+                logger.log('ActorCritic/alea_confidence_mean', alea_confidence.mean().item())
+                logger.log('ActorCritic/alea_confidence_std', alea_confidence.std(unbiased=False).item())
+            if epi_confidence is not None:
+                logger.log('ActorCritic/epi_confidence_mean', epi_confidence.mean().item())
+                logger.log('ActorCritic/epi_confidence_std', epi_confidence.std(unbiased=False).item())
+            if alea_actor_w is not None:
+                logger.log('ActorCritic/alea_actor_weight_mean', alea_actor_w.mean().item())
+            if epi_actor_w is not None:
+                logger.log('ActorCritic/epi_actor_weight_mean', epi_actor_w.mean().item())
+            if alea_value_w is not None:
+                logger.log('ActorCritic/alea_value_weight_mean', alea_value_w.mean().item())
+            if epi_value_w is not None:
+                logger.log('ActorCritic/epi_value_weight_mean', epi_value_w.mean().item())
+            if decomposed_score is not None:
+                logger.log('ActorCritic/decomposed_score_mean', decomposed_score.mean().item())
+                logger.log('ActorCritic/decomposed_score_std', decomposed_score.std(unbiased=False).item())
+            if actor_weights is not None and self.uncertainty_mode == "ensemble_decomposed":
+                logger.log('ActorCritic/final_actor_weight_mean', actor_weights.mean().item())
+            if value_weights is not None and self.uncertainty_mode == "ensemble_decomposed":
+                logger.log('ActorCritic/final_value_weight_mean', value_weights.mean().item())
